@@ -42,417 +42,235 @@
 
 ## 2. 全体アーキテクチャ
 
-本プロジェクトは **Hexagonal (Ports & Adapters) Architecture** の論理設計を採用しつつ、物理的には **単一クレート + モジュール階層** で実現します。レイヤ境界は Rust の `mod` ツリーと可視性 (`pub(crate)` / `pub(super)`) で表現し、Cargo workspace のオーバーヘッドを払いません。UI 層は **MVU (Model-View-Update) スタイル**を採り、副作用と状態変化を明確に分離します。
+本プロジェクトは **単一クレート + 平坦なモジュール構成**で実装します。Hexagonal や Clean Architecture のような層分割は採らず、規模に見合った素朴な構造で進めます。一方で **挿入処理 (.alc / Remote Script の差し替え) だけは trait で抽象化**します — ここは唯一、本当に複数実装を切り替える必然があるからです。
 
-これにより:
+### 2.1 設計方針
 
-- ドメインロジックが I/O・GUI・DAW 連携と独立する (層を跨ぐ依存はモジュール階層と code review で守る)
-- 挿入経路 (.alc / Remote Script) や永続化先を差し替えてもコアが変わらない
-- UI と副作用が分離され、テスト容易性が高い
-- Cargo.toml 1 個・`cargo build` 1 回で完結。将来クレート分割が必要になったら、各レイヤのモジュールをそのまま `crates/` 配下に切り出せばよい
+1. **基本は `AppState` ベースの素朴な egui アプリ**。`AppState` が唯一の状態保持者で、view 関数は `&mut AppState` を取って直接ミューテーションする。MVU の正式な `Msg` / `update` / `Cmd` 機構は採用しない (規模に対して過剰)。
+2. **`Inserter` trait だけ抽象化**。alc バックエンドと Remote Script バックエンドを差し替え可能にし、Composite で組み合わせる。それ以外 (オーディオ / 永続化 / SRT パース) は具体実装を直接呼ぶ。
+3. **重い処理はワーカースレッドへ**。alc 生成、Remote Script への TCP 通信、SRT 一括読み込みなどは `crossbeam_channel` 越しにバックグラウンド処理する。`AppState` には channel の両端だけ持たせ、毎フレーム `try_recv` でドレイン。
+4. **純粋関数として書ける部分は積極的に切り出す**。SRT パース、話者抽出、フィルタマッチング、alc XML 生成は副作用ゼロの関数にして、`#[cfg(test)]` で直接テスト。
 
-### 2.1 レイヤ構成 (Hexagonal)
-
-```
-                    ┌──────────────────────────┐
-                    │      app (main.rs)        │   ← 合成ルート (Composition Root)
-                    │   全 adapter を組み立て   │
-                    └────────────┬──────────────┘
-                                 │ 依存
-            ┌────────────────────┼────────────────────┐
-            ▼                    ▼                    ▼
-     ┌────────────┐        ┌──────────┐        ┌────────────┐
-     │ ui (MVU)   │        │ runtime  │        │  adapter   │
-     │            │        │ (Cmd 実行)│        │ (実装)     │
-     └─────┬──────┘        └────┬─────┘        └─────┬──────┘
-           │                    │                    │
-           │                    ▼                    │
-           │              ┌──────────┐               │
-           │              │application│              │
-           │              │ (use case)│              │
-           │              └────┬─────┘               │
-           │                   │                     │
-           │                   ▼                     │
-           │              ┌──────────┐               │
-           └─────────────▶│  ports   │◀──────────────┘
-                          │  (trait) │
-                          └────┬─────┘
-                               │
-                               ▼
-                          ┌──────────┐
-                          │  domain  │   ← 依存ゼロ。pure types
-                          └──────────┘
-```
-
-**依存の方向は外→内のみ**。`domain` は何にも依存せず、`ports` は `domain` のみ、`application` と `adapter::*` は `domain` + `ports` のみに依存します。逆方向 (domain が adapter を知る等) は禁止。
-
-| モジュール | 役割 | 例 |
-|----|------|------|
-| `crate::domain` | 不変条件を持つ純粋なドメイン型 | `SrtItem`, `SrtSource`, `Filter`, `Library`, `ItemId` |
-| `crate::ports` | 外界とのやり取りの抽象 (trait のみ) | `Inserter`, `AudioPlayer`, `MetadataStore`, `SrtRepository` |
-| `crate::application` | use case (port を組み合わせて意味のある操作を実行) | `LoadSrtUseCase`, `InsertItemsUseCase`, `AddSpeakerTagsUseCase` |
-| `crate::adapter::*` | port の具体実装 (技術選定を内包) | `adapter::alc`, `adapter::remote`, `adapter::audio_rodio`, `adapter::persistence_fs` |
-| `crate::ui` | egui ベースの View + MVU の Model/Msg/update | `AppModel`, `Msg`, `update`, `view::*` |
-| `crate::runtime` | UI からの `Cmd` を受けて application を呼び、結果を `Msg` で返す | `Runtime::dispatch(cmd)` |
-| `crate::app` (= `main.rs`) | バイナリ。全 adapter を構築して runtime と UI を起動 | `main()` |
-
-### 2.2 レイヤ境界の運用ルール (Rust の機能で表現できる範囲)
-
-Rust のモジュールはコンパイラレベルで「モジュール A はモジュール B を import 禁止」とは強制できません。代わりに以下の規約で運用します:
-
-1. **`mod.rs` での再エクスポートを最小化**。`crate::domain::*` で全部見えるような `pub use` をしない。各モジュールは必要なものだけ `pub` で公開
-2. **下位レイヤから上位レイヤを `use` しない** ことを code review でチェック。具体的には:
-   - `domain/*.rs` のどこにも `use crate::adapter::` `use crate::ui::` `use crate::application::` `use crate::ports::` が出ない
-   - `ports/*.rs` には `use crate::domain::` のみ
-   - `adapter/*.rs` と `application/*.rs` には `use crate::domain::` と `use crate::ports::` のみ
-3. **CI で grep ベースのチェックを足す** (任意):
-   ```bash
-   ! grep -rn "use crate::adapter\|use crate::ui\|use crate::runtime" src/domain src/ports
-   ```
-4. **`pub(crate)` を積極的に使う**。adapter の内部型が UI から触れないようにする
-
-### 2.3 MVU ループ (UI 層)
-
-UI は **immediate mode (egui) を MVU の View として扱う**。「View が直接モデルを書き換える」のではなく「View は `Msg` を返すだけ」とすることで、状態変化が `update` 関数に集約されます。
+### 2.2 全体図
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    MVU loop (毎フレーム)                       │
-│                                                                │
-│  ┌─────────┐    view(model)    ┌─────────┐                    │
-│  │  Model  │ ─────────────────▶│  View   │                    │
-│  └─────────┘                   │ (egui)  │                    │
-│       ▲                        └────┬────┘                    │
-│       │                             │ ユーザ操作              │
-│       │                             ▼                          │
-│       │                       ┌──────────┐                    │
-│       │                       │   Msg    │ (Vec<Msg>)         │
-│       │                       └────┬─────┘                    │
-│       │                            │                          │
-│       │   update(model, msg)       │                          │
-│       └────────────────────────────┤                          │
-│                                    │                          │
-│                                    ▼                          │
-│                              ┌──────────┐                    │
-│                              │   Cmd    │ (Vec<Cmd>)         │
-│                              └────┬─────┘                    │
-│                                   │ runtime.dispatch(cmd)    │
-└───────────────────────────────────┼──────────────────────────┘
-                                    │
-                                    ▼ (非同期、別スレッド)
-                              ┌──────────┐
-                              │ Use Case │ (application)
-                              └────┬─────┘
-                                   │ ports 経由で adapter 呼出
-                                   ▼ 完了
-                              ┌──────────┐
-                              │   Msg    │ ──┐ runtime → MVU
-                              └──────────┘   │ への mpsc channel
-                                              │
-                                              ▼ 次フレームで update に流入
+                ┌──────────────────────────────┐
+                │   main.rs                     │
+                │   - eframe::run_native        │
+                │   - AppState (eframe::App)    │
+                │   - worker thread             │
+                └──────────┬────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+        ▼                  ▼                  ▼
+   ┌─────────┐      ┌──────────┐       ┌──────────────┐
+   │   ui    │      │  audio   │       │  insertion   │
+   │ (view)  │      │ (rodio)  │       │  ┌────────┐  │
+   └────┬────┘      └──────────┘       │  │ trait  │  │
+        │                              │  │Inserter│  │
+        │                              │  └───┬────┘  │
+        │                              │  ┌───┴────┐  │
+        │                              │  │  alc   │  │
+        │                              │  │ remote │  │
+        │                              │  │compose │  │
+        │                              │  └────────┘  │
+        │                              └──────┬───────┘
+        │  state read/write                   │
+        ▼                                     │
+   ┌──────────────────────────────────────────▼─────┐
+   │ srt / metadata / settings / library / i18n /   │
+   │ util                                            │
+   │ (ピュアロジック + JSON 永続化)                   │
+   └────────────────────────────────────────────────┘
 ```
 
-主要な型:
+`crates/remote_script/` は別途 Python パッケージ (本ツリーに含まれるが Cargo の管理外)。
+
+### 2.3 並行モデル
+
+- **メインスレッド**: egui 描画 + AppState のミューテーション
+- **ワーカースレッド (1 本)**: 重い I/O 処理 (alc 生成、リモート TCP、SRT 一括読込) を実行
+  - `WorkerCmd` を `crossbeam_channel::Sender` で受け取り
+  - 完了結果を `WorkerEvent` で返す
+- **rodio** が内部で持つ再生スレッド (アプリからは隠蔽)
+- **Remote Script クライアント** が接続維持のために持つスレッド (`insertion::remote` 内に閉じ込める)
 
 ```rust
-pub struct AppModel { /* 純粋データ。ui_egui::model に定義 */ }
+// 概略
+pub struct AppState {
+    // 純粋ドメイン状態
+    pub source: Option<SrtSource>,
+    pub library: Option<Library>,
+    pub settings: Settings,
+    pub filter_text: String,
+    pub selected: Vec<usize>,
+    // ...
 
-pub enum Msg {
-    // ユーザ操作起源
-    LoadSrtRequested(PathBuf),
-    SelectionChanged(Vec<ItemId>),
-    FilterChanged(String),
-    FavoriteToggled(ItemId),
-    InsertRequested { trigger: InsertionTrigger },
-    PreviewRequested,
-    // 副作用の完了通知 (runtime 起源)
-    SrtLoaded(SrtSource),
-    SrtLoadFailed(String),
-    InsertSucceeded { count: usize },
-    InsertFailed(String),
-    RemoteStateChanged { tempo: f64, cursor_beats: f64 },
-    RemoteConnected,
-    RemoteDisconnected,
+    // 副作用窓口
+    pub inserter: Arc<dyn Inserter>,
+    pub player: PreviewPlayer,
+    pub worker_tx: Sender<WorkerCmd>,
+    pub worker_rx: Receiver<WorkerEvent>,
+}
+
+pub enum WorkerCmd {
+    LoadSrt(PathBuf),
+    SaveMetadata(PathBuf, SourceMetadata),
+    InsertViaAlc(InsertionRequest),
     // ...
 }
 
-pub enum Cmd {
-    Nop,
-    LoadSrt(PathBuf),
-    SaveMetadata(SourceId),
-    Insert { trigger: InsertionTrigger, items: Vec<InsertionItem>, tempo_bpm: f64 },
-    StartPreview { ranges: Vec<(PathBuf, Duration, Duration)> },
-    StopPreview,
-    PingRemote,
-    Batch(Vec<Cmd>),
+pub enum WorkerEvent {
+    SrtLoaded(SrtSource),
+    SrtLoadFailed(String),
+    AlcReady(Vec<PathBuf>),
+    InsertSucceeded { count: usize },
+    InsertFailed(String),
+    RemoteState { tempo: f64, cursor_beats: f64 },
+    // ...
 }
-
-pub fn update(model: AppModel, msg: Msg) -> (AppModel, Cmd) { /* pure */ }
-pub fn view(model: &AppModel, ui: &mut egui::Ui) -> Vec<Msg>  { /* pure-ish */ }
 ```
 
-ポイント:
+### 2.4 テスト戦略
 
-1. **`update` は副作用ゼロの純粋関数**。テストが書きやすい。
-2. **`Cmd` は「やってほしい副作用の記述」**。実行は runtime に委譲。
-3. **`view` はモデルから `Vec<Msg>` を返す**。egui の `Response` から発火した Msg を集めるだけで、モデルを直接ミューテーションしない。
-4. **副作用の結果も `Msg` として戻ってくる**。すべての状態変化は `update` の単一の入口を通る。
+| 対象 | テスト |
+|------|--------|
+| 純粋関数 (`srt::parse`, `srt::split_speaker`, `srt::auto_match_audio`, `Filter::matches`, `insertion::alc::xml::render`) | 関数単位のユニットテスト |
+| `Inserter` trait | テスト時は手書き `MockInserter` を `AppState` に注入 |
+| 永続化 (JSON I/O) | `tempfile` で実 I/O 統合テスト |
+| UI (`view::*` 関数群) | 基本テストしない (egui の immediate-mode で副作用が広いため、コストに見合わない) |
+| 起動 / Live 接続 | `cargo run --release` の手動確認 |
 
-### 2.4 並行モデル
+`AppState` のメソッド (例: `toggle_favorite`, `apply_offset`) は副作用が周辺フィールドのみに閉じるなら `#[cfg(test)]` でユニットテストできる。
 
-- **メインスレッド**: egui 描画 + MVU の `view` / `update` ループ
-- **runtime のワーカースレッド**: `Cmd` を受け取り、application 経由で adapter を叩く。完了結果を `crossbeam_channel::Sender<Msg>` でメインに流す
-- **rodio**: 内部で再生スレッドを持つので、`adapter::audio_rodio` 内に隠蔽。runtime から見ると `play` / `stop` の同期メソッド呼出
-- **Remote Script クライアント**: 接続・購読のための専用スレッド 1 本 (`adapter::remote` 内)。Live からのイベント (tempo / song_time など) を `Msg::RemoteStateChanged` に変換して runtime チャネルに投げる
-- **ファイル監視 (任意)**: `notify` クレートで別スレッド
-
-ロックを共有しない設計 (model はメインスレッド専有、副作用は Cmd / Msg で往復) なので、`Arc<Mutex<...>>` の出番はほぼない。
-
-### 2.5 ディスク IO
-
-- **設定 / メタデータの書き込み**: 小サイズなのでメインスレッドで debounce 後に同期書き込みでも問題なし。気になるなら `Cmd::SaveMetadata(SourceId)` 経由で runtime に逃がす
-- **SRT 一括読み込み (ライブラリ起動時)**: `Cmd::LoadSrt(...)` を投げて runtime のワーカースレッドで処理、進捗を `Msg::LoadProgress(..)` で返す
-
-### 2.6 テスト戦略
-
-| 層 | テスト | ポイント |
-|----|--------|---------|
-| `domain` | ピュアな関数のユニットテスト | I/O 不要 |
-| `ports` | trait 自体はテスト対象外 | mock は `application` のテスト内に手書きで置く (`mockall` は使わずに OK) |
-| `application` | use case のユニットテスト (手書き mock port を注入) | port 越しに副作用を観察 |
-| `adapter::*` | 統合テスト (実 I/O を伴う) | `tempfile` で隔離 |
-| `ui` | `update` 関数のスナップショットテスト | `view` は基本テストしない |
-| `app` (`main.rs`) | 起動 / 接続テスト | `cargo run --release` の手動確認 |
-
-単一クレートなので `tests/` 配下の統合テストもクレート全体にアクセス可能。MVU の `update` も `#[cfg(test)]` で隣のモジュールから直接叩ける。
-
-## 3. リポジトリ構成 (単一クレート + レイヤモジュール)
-
-Hexagonal の各層を **`src/` 配下のサブモジュール** で表現します。Cargo は単一クレート構成。Cargo.toml も `lib.rs` も 1 個。
+## 3. リポジトリ構成 (単一クレート / 11 ファイル)
 
 ```
 abletonsrtbrowser/
 ├── Cargo.toml
 ├── README.md
 ├── LICENSE
-├── build.rs                         # Windows のアイコン埋め込み
+├── build.rs                  # Windows のアイコン埋め込み
 ├── crates/
-│   └── remote_script/               # Python (Cargo の管理外)
+│   └── remote_script/        # Python (Cargo の管理外)
 │       ├── README.md
 │       ├── __init__.py
 │       ├── manager.py
 │       ├── server.py
 │       └── handlers.py
 ├── src/
-│   ├── main.rs                      # 合成ルート: 全 adapter を構築 → Runtime → UI 起動
-│   ├── lib.rs                       # mod 宣言のみ (テストから使う)
-│   │
-│   ├── domain/                      # 依存ゼロ。pure types。I/O / GUI を一切知らない
-│   │   ├── mod.rs
-│   │   ├── ids.rs                   # SourceId, ItemId, LibraryId, FolderId
-│   │   ├── srt.rs                   # SrtItem, ItemKey
-│   │   ├── source.rs                # SrtSource, ItemMeta, SourceMetadata
-│   │   ├── library.rs               # Library, LibFolder
-│   │   ├── filter.rs                # Filter
-│   │   ├── insertion.rs             # InsertionItem, InsertionRequest, InsertionTrigger, InsertionOutcome
-│   │   └── audio_range.rs           # AudioRange (file + start + end)
-│   │
-│   ├── ports/                       # trait のみ。`use crate::domain::*` だけ許容
-│   │   ├── mod.rs
-│   │   ├── inserter.rs              # trait Inserter
-│   │   ├── audio_player.rs          # trait AudioPlayer
-│   │   ├── srt_repo.rs              # trait SrtRepository
-│   │   ├── audio_matcher.rs         # trait AudioMatcher
-│   │   ├── metadata_store.rs        # trait MetadataStore
-│   │   ├── settings_store.rs        # trait SettingsStore
-│   │   ├── library_store.rs         # trait LibraryStore
-│   │   └── live_state.rs            # trait LiveStateProvider
-│   │
-│   ├── application/                 # use case。`use crate::{domain, ports}::*` のみ
-│   │   ├── mod.rs
-│   │   ├── load_srt.rs              # LoadSrtUseCase
-│   │   ├── insert_items.rs          # InsertItemsUseCase
-│   │   ├── preview_items.rs         # PreviewItemsUseCase
-│   │   ├── update_metadata.rs       # UpdateMetadataUseCase
-│   │   ├── add_speaker_tags.rs      # AddSpeakerTagsUseCase
-│   │   ├── apply_offset.rs          # ApplyOffsetUseCase
-│   │   └── library_ops.rs           # LibraryOpsUseCase
-│   │
-│   ├── adapter/                     # 各 port の実装。`use crate::{domain, ports}::*` のみ
-│   │   ├── mod.rs
-│   │   ├── alc/
-│   │   │   ├── mod.rs               # impl Inserter for AlcInserter
-│   │   │   ├── xml.rs
-│   │   │   └── temp_dir.rs
-│   │   ├── remote/
-│   │   │   ├── mod.rs               # impl Inserter, impl LiveStateProvider
-│   │   │   ├── client.rs            # TCP+JSON クライアント
-│   │   │   ├── protocol.rs          # serde 型
-│   │   │   └── reconnect.rs
-│   │   ├── audio_rodio.rs           # impl AudioPlayer (rodio + symphonia)
-│   │   ├── persistence_fs.rs        # impl MetadataStore / SettingsStore / LibraryStore
-│   │   ├── srt_parser.rs            # impl SrtRepository / AudioMatcher
-│   │   └── composite_inserter.rs    # 合成: alc + remote をラップ
-│   │
-│   ├── runtime/                     # MVU runtime。`use crate::{application, domain}::*` を使う
-│   │   ├── mod.rs
-│   │   ├── cmd.rs                   # Cmd enum
-│   │   ├── msg_bus.rs               # crossbeam チャネルのラッパ
-│   │   └── executor.rs              # Cmd → use case 呼出 → Msg 戻し
-│   │
-│   ├── ui/                          # MVU の Model/Msg/update + egui view
-│   │   ├── mod.rs
-│   │   ├── model.rs                 # AppModel
-│   │   ├── msg.rs                   # Msg enum
-│   │   ├── update.rs                # update(model, msg) -> (model, Cmd)
-│   │   ├── runtime_glue.rs          # eframe::App 実装、毎フレーム drain → update → view
-│   │   ├── drag_out.rs              # drag クレートとの統合
-│   │   ├── i18n/
-│   │   │   ├── mod.rs
-│   │   │   ├── en.rs
-│   │   │   └── ja.rs
-│   │   └── view/
-│   │       ├── mod.rs
-│   │       ├── menu.rs
-│   │       ├── source_pane.rs
-│   │       ├── library_pane.rs
-│   │       ├── item_table.rs
-│   │       ├── detail_pane.rs
-│   │       ├── dialogs.rs
-│   │       ├── toasts.rs
-│   │       └── shortcuts.rs
-│   │
-│   └── util/
-│       ├── mod.rs
-│       ├── debounce.rs
-│       ├── path_hash.rs             # SHA-256 ベースのファイル名生成
-│       └── atomic.rs                # atomic write (tmp + rename)
+│   ├── main.rs               # eframe 起動 + AppState (eframe::App impl) + ワーカースレッド起動
+│   ├── srt.rs                # SrtItem / SrtSource / parse / 話者抽出 / auto_match_audio
+│   ├── metadata.rs           # ItemMeta + per-source JSON 読み書き
+│   ├── settings.rs           # Settings + settings.json 読み書き
+│   ├── library.rs            # Library + libraries.json 読み書き
+│   ├── audio.rs              # PreviewPlayer (rodio + symphonia)
+│   ├── insertion/
+│   │   ├── mod.rs            # Inserter trait + Composite + 共通型 (InsertionItem 等)
+│   │   ├── alc.rs            # AlcInserter (.alc 生成 + drag-out)
+│   │   └── remote.rs         # RemoteScriptInserter (TCP+JSON)
+│   ├── ui.rs                 # 全 view 関数 (menu / source_pane / library_pane / item_table / detail_pane)
+│   ├── i18n.rs               # en/ja の HashMap + t() ヘルパ
+│   └── util.rs               # debounce / path_hash / atomic_write
 ├── resources/
-│   ├── alc_template.xml             # .alc XML テンプレート (`include_str!`)
-│   ├── fonts/                       # 同梱フォント (NotoSansCJK 等)
+│   ├── alc_template.xml      # .alc XML テンプレート (`include_str!`)
+│   ├── fonts/                # 同梱フォント (NotoSansCJK 等)
 │   └── icons/
-│       ├── icon.icns                # macOS
-│       ├── icon.ico                 # Windows
-│       └── drag_icon.png            # drag-out のドラッグ中プレビュー
-├── tests/                           # 統合テスト (クレート全体にアクセス可)
+│       ├── icon.icns         # macOS
+│       ├── icon.ico          # Windows
+│       └── drag_icon.png     # drag-out のドラッグ中プレビュー
+├── tests/                    # 統合テスト (`abletonsrtbrowser` クレート全体にアクセス)
 │   ├── srt_parser.rs
-│   ├── alc_xml.rs                   # alc 出力のスナップショット
-│   ├── filter.rs
-│   └── insert_use_case.rs
+│   ├── alc_xml.rs            # alc 出力のスナップショット (insta)
+│   └── filter.rs
 └── docs/
-    ├── REMOTE_SCRIPT_INSTALL.md     # ユーザ向けセットアップ
-    └── ARCHITECTURE.md              # 開発者向け
+    ├── REMOTE_SCRIPT_INSTALL.md
+    └── ARCHITECTURE.md
 ```
 
-### 3.1 `lib.rs` の構造
+### 3.1 トップレベルファイルの責務
 
-```rust
-// src/lib.rs
-pub mod domain;
-pub mod ports;
-pub mod application;
-pub mod adapter;
-pub mod runtime;
-pub mod ui;
-pub mod util;
-```
+| ファイル | 内容 |
+|---------|------|
+| `main.rs` | eframe::run_native、AppState 定義 + `eframe::App` 実装、ワーカースレッド spawn、Inserter 組み立て (alc + remote → Composite) |
+| `srt.rs` | `SrtItem` / `SrtSource` / `parse_srt(&str) -> Vec<SrtItem>` / `split_speaker(&str) -> (Option<String>, String)` / `auto_match_audio(&Path) -> Option<PathBuf>` |
+| `metadata.rs` | `SourceMetadata` (serde)、`load(&Path)` / `save(&Path, &SourceMetadata)`、`ItemMeta` のマージロジック |
+| `settings.rs` | `Settings` (serde) + 読み書き |
+| `library.rs` | `Library` / `LibFolder` + libraries.json 読み書き |
+| `audio.rs` | `PreviewPlayer::new` / `play_ranges` / `stop` / `set_volume` |
+| `insertion/mod.rs` | `Inserter` trait、`InsertionItem` / `InsertionRequest` / `InsertionTrigger` / `InsertionOutcome`、`Composite` |
+| `insertion/alc.rs` | `AlcInserter` (`Inserter` を実装) |
+| `insertion/remote.rs` | `RemoteScriptInserter` (`Inserter` を実装、TCP 通信スレッドも内包) |
+| `ui.rs` | `pub fn menu_bar(ui, app)` / `pub fn source_pane(ui, app)` / `pub fn library_pane(ui, app)` / `pub fn item_table(ui, app)` / `pub fn detail_pane(ui, app)` / ショートカット処理 |
+| `i18n.rs` | `Lang` enum、`STRINGS_EN` / `STRINGS_JA` 静的 HashMap、`t(lang, key)` |
+| `util.rs` | `Debounced`、`path_hash`、`atomic_write_json` |
 
-`main.rs` は `lib.rs` を経由して各モジュールを使う:
+### 3.2 命名規則
 
-```rust
-// src/main.rs
-use abletonsrtbrowser::{adapter, application, runtime, ui};
+- モジュール名はスネークケース、型名はパスカルケース
+- trait 名は名詞 (`Inserter`)、関数は動詞 (`parse_srt`, `play_ranges`)
+- 純粋関数は `srt::parse_srt` のような自由関数として置き、メソッドは状態を持つ型 (`PreviewPlayer`, `AppState`) のみに付ける
 
-fn main() -> anyhow::Result<()> { /* ... 合成ルート */ }
-```
+### 3.3 Python パッケージ
 
-`lib.rs` を分けておくと統合テスト (`tests/*.rs`) からクレート全体にアクセスできる。
+`crates/remote_script/` は **Cargo の管理外**。Python パッケージとして独立。リリース時は zip にまとめて GitHub Release assets に同梱。
 
-### 3.2 モジュール間の依存方向 (運用ルール)
+### 3.4 ファイルが肥大化したら
 
-```
-domain         ← (誰からも依存される / 何にも依存しない)
-   ▲
-   │
-ports          ← domain のみ
-   ▲
-   │
-application    ← domain, ports
-adapter::*     ← domain, ports
-   ▲
-   │
-runtime        ← domain, ports, application
-ui             ← domain, runtime  (※ ports / application を直接 use しない)
-   ▲
-   │
-main.rs        ← 全部 (合成ルートだけが具体型を知る)
-```
+`ui.rs` (推定 1500 行前後) が手狭になったら、その時点で `ui/` ディレクトリに昇格して `ui/{menu,source_pane,...}.rs` に分割する。最初から分割しない。`insertion/` と同じパターン。同様に `metadata.rs` / `settings.rs` / `library.rs` も、永続化ロジックが膨らんだら分割を検討。
 
-各モジュールの `mod.rs` 冒頭に許可される `use` 範囲をコメントで明記し、code review で違反を弾きます。CI で grep ベースの簡易チェックを追加しても良い (Section 14 参照)。
-
-### 3.3 命名規則
-
-- モジュール名はスネークケース (`adapter::audio_rodio` のように技術名を suffix)
-- 同じ port に複数 adapter を持てる (例: 将来 `adapter::audio_cpal_direct` を追加可能)
-- 型名はパスカルケース、trait 名は名詞 (`Inserter`, `AudioPlayer`)、use case 型は `<動詞>UseCase` (`InsertItemsUseCase`)
-
-### 3.4 Python パッケージ
-
-`crates/remote_script/` は **Cargo の管理外**。Python パッケージとして単独配布。`build.rs` から参照することもありません。リリース時は別途 zip にまとめて GitHub Release assets に同梱。
-
-### 3.5 なぜ単一クレートか
+### 3.5 なぜこの構成か
 
 | 別案 | 採用しない理由 |
 |------|---------|
-| Cargo workspace で 11 crate 分割 | 1 人メンテで boilerplate (Cargo.toml × 11、`lib.rs` × 10) が重い。コンパイル時間も増える。レイヤ強制のメリットは code review で代替可能 |
-| `core` + `ui` + `app` の 3 crate workspace | 中間案として悪くないが、レイヤを 1 段挟むだけのために workspace を構えるのはやはり過剰 |
-| すべて 1 つの `mod` 階層に flat 配置 | レイヤ責任が読み取れず、移植元 (Lua 単一ファイル) と同じ問題に陥る |
+| Cargo workspace で 11 crate に分割 | 1 人メンテで boilerplate と compile time が割に合わない |
+| `domain/ports/application/adapter/...` のレイヤモジュール構成 | port が `Inserter` 1 個しかないのにレイヤを切ると形骸化する |
+| すべて `main.rs` に書く | 4474 行の Lua 単一ファイルと同じ問題 |
+| `ui.rs` を最初から `ui/{menu,...}.rs` に分割 | この規模では outline ナビゲーションで十分 |
 
-将来本当にクレート分割が必要になったら、各レイヤをそのまま `crates/<layer>/src/` に `mv` できるよう、レイヤ間の `pub use` を最小に保つこと。
-
-## 4. Cargo workspace 設定
-
-### 4.1 ワークスペースルート (`/Cargo.toml`)
+## 4. 依存クレート (`Cargo.toml`)
 
 ```toml
-[workspace]
-resolver = "2"
-members = [
-    "crates/domain",
-    "crates/ports",
-    "crates/application",
-    "crates/adapter_alc",
-    "crates/adapter_remote",
-    "crates/adapter_audio_rodio",
-    "crates/adapter_persistence_fs",
-    "crates/adapter_srt_parser",
-    "crates/runtime",
-    "crates/ui_egui",
-    "crates/app",
-]
-# crates/remote_script は Python なのでメンバーに含めない
-
-[workspace.package]
+[package]
+name = "abletonsrtbrowser"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-authors = ["..."]
 license = "MIT"
 repository = "https://github.com/<user>/abletonsrtbrowser"
 
-[workspace.dependencies]
-# 内部
-abletonsrtbrowser-domain      = { path = "crates/domain" }
-abletonsrtbrowser-ports       = { path = "crates/ports" }
-abletonsrtbrowser-application = { path = "crates/application" }
-abletonsrtbrowser-runtime     = { path = "crates/runtime" }
-abletonsrtbrowser-ui-egui     = { path = "crates/ui_egui" }
+[dependencies]
+# GUI
+eframe       = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui         = "0.30"
+egui_extras  = { version = "0.30", features = ["all_loaders"] }
+egui_dnd     = "0.10"          # ライブラリ内のソース並び替え
 
-# 外部 (バージョンを workspace に集約しておくと crate 間で揃う)
+# ファイルダイアログ
+rfd          = "0.15"
+
+# Drag-out (アプリ外へのファイル D&D)
+drag             = "0.4"        # tauri-apps/drag。winit / tao の raw window handle で動く
+raw-window-handle = "0.6"
+
+# シリアライズ
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 quick-xml  = { version = "0.36", features = ["serialize"] }
+
+# 圧縮 (.alc は gzip)
 flate2     = "1"
+
+# オーディオ
+rodio      = { version = "0.20", default-features = false, features = ["symphonia-all"] }
+symphonia  = { version = "0.5",  features = ["all"] }
+hound      = "3"                # WAV ヘッダ読み (フレーム数 / SR の高速取得)
+
+# 並行
+crossbeam-channel = "0.5"       # メインスレッド ↔ ワーカースレッド
+
+# その他
 anyhow     = "1"
 thiserror  = "1"
 tracing    = "0.1"
@@ -461,30 +279,17 @@ once_cell  = "1"
 regex      = "1"
 dirs       = "5"
 sha2       = "0.10"
-unicode-segmentation = "1"
-walkdir    = "2"
+unicode-segmentation = "1"      # 話者ラベル抽出 / 検索
+walkdir    = "2"                # 自動オーディオ検出
 chrono     = { version = "0.4", default-features = false, features = ["clock"] }
-crossbeam-channel    = "0.5"
 
-# GUI 系
-eframe       = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "persistence"] }
-egui         = "0.30"
-egui_extras  = { version = "0.30", features = ["all_loaders"] }
-egui_dnd     = "0.10"
-rfd          = "0.15"
-drag         = "0.4"
-raw-window-handle = "0.6"
-
-# オーディオ
-rodio       = { version = "0.20", default-features = false, features = ["symphonia-all"] }
-symphonia   = { version = "0.5", features = ["all"] }
-hound       = "3"
-
-# テスト
-insta             = "1"
+[dev-dependencies]
+insta             = "1"         # alc XML のスナップショットテスト
 pretty_assertions = "1"
 tempfile          = "3"
-mockall           = "0.13"   # ports の mock 自動生成 (任意)
+
+[build-dependencies]
+winres = "0.1"                  # Windows のアイコン埋め込み (build.rs から呼ぶ)
 
 [profile.release]
 opt-level    = 3
@@ -493,229 +298,7 @@ codegen-units = 1
 strip        = true
 ```
 
-### 4.2 各 crate の `Cargo.toml` 例
-
-#### `crates/domain/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-domain"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde.workspace = true                       # シリアライズが必要な型のみ derive
-thiserror.workspace = true
-unicode-segmentation.workspace = true        # ItemKey 比較などで使用
-```
-
-`domain` は外部 I/O 依存ゼロ。ファイルもネットも GUI も触らない。
-
-#### `crates/ports/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-ports"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-anyhow.workspace = true
-```
-
-trait 定義のみ。実装は持たない。
-
-#### `crates/application/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-application"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-mockall.workspace = true
-pretty_assertions.workspace = true
-```
-
-#### `crates/adapter_alc/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-adapter-alc"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace = true
-flate2.workspace = true
-hound.workspace  = true
-chrono.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-insta.workspace    = true
-tempfile.workspace = true
-```
-
-#### `crates/adapter_remote/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-adapter-remote"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace = true
-serde.workspace      = true
-serde_json.workspace = true
-crossbeam-channel.workspace = true
-tracing.workspace = true
-```
-
-#### `crates/adapter_audio_rodio/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-adapter-audio-rodio"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace  = true
-rodio.workspace   = true
-symphonia.workspace = true
-tracing.workspace = true
-```
-
-#### `crates/adapter_persistence_fs/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-adapter-persistence-fs"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace = true
-serde.workspace      = true
-serde_json.workspace = true
-sha2.workspace = true
-dirs.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
-```
-
-#### `crates/adapter_srt_parser/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-adapter-srt-parser"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace = true
-abletonsrtbrowser-ports.workspace  = true
-anyhow.workspace = true
-regex.workspace  = true
-once_cell.workspace = true
-walkdir.workspace = true
-unicode-segmentation.workspace = true
-tracing.workspace = true
-```
-
-#### `crates/runtime/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-runtime"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace      = true
-abletonsrtbrowser-ports.workspace       = true
-abletonsrtbrowser-application.workspace = true
-anyhow.workspace = true
-crossbeam-channel.workspace = true
-tracing.workspace = true
-```
-
-#### `crates/ui_egui/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser-ui-egui"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-abletonsrtbrowser-domain.workspace  = true
-abletonsrtbrowser-runtime.workspace = true
-eframe.workspace      = true
-egui.workspace        = true
-egui_extras.workspace = true
-egui_dnd.workspace    = true
-rfd.workspace         = true
-drag.workspace        = true
-raw-window-handle.workspace = true
-once_cell.workspace = true
-tracing.workspace = true
-```
-
-⚠ `ui_egui` は **`ports` も `application` も `adapter_*` も依存に持ちません**。Cmd / Msg を経由してのみ runtime と通信します。
-
-#### `crates/app/Cargo.toml`
-
-```toml
-[package]
-name        = "abletonsrtbrowser"
-version.workspace = true
-edition.workspace = true
-
-[[bin]]
-name = "abletonsrtbrowser"
-path = "src/main.rs"
-
-[dependencies]
-abletonsrtbrowser-domain.workspace      = true
-abletonsrtbrowser-ports.workspace       = true
-abletonsrtbrowser-application.workspace = true
-abletonsrtbrowser-runtime.workspace     = true
-abletonsrtbrowser-ui-egui.workspace     = true
-abletonsrtbrowser-adapter-alc              = { path = "../adapter_alc" }
-abletonsrtbrowser-adapter-remote           = { path = "../adapter_remote" }
-abletonsrtbrowser-adapter-audio-rodio      = { path = "../adapter_audio_rodio" }
-abletonsrtbrowser-adapter-persistence-fs   = { path = "../adapter_persistence_fs" }
-abletonsrtbrowser-adapter-srt-parser       = { path = "../adapter_srt_parser" }
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-
-[build-dependencies]
-winres = "0.1"   # Windows のアイコン埋め込み
-```
-
-### 4.3 クレート選定の根拠
+### 4.1 クレート選定の根拠
 
 | 用途 | 採用 | 理由 |
 |------|------|------|
@@ -727,27 +310,28 @@ winres = "0.1"   # Windows のアイコン埋め込み
 | シリアライズ | `serde_json` / `quick-xml` | JSON は設定 / メタデータ、XML は `.alc` 用。 |
 | 圧縮 | `flate2` | `.alc` は gzip。 |
 | ダイアログ | `rfd` | OS ネイティブのファイルピッカー。 |
-| MVU 用チャネル | `crossbeam-channel` | `std::sync::mpsc` より柔軟 (try_recv の挙動・select! 等)。 |
-| Mock | `mockall` | ports trait の mock を `#[automock]` で生成、application のテストで利用。 |
+| 並行 | `crossbeam-channel` | `std::sync::mpsc` より柔軟 (`try_recv` のセマンティクスや `select!` がある)。ワーカースレッドとの双方向通信に使う。 |
 
-### 4.4 採用しないもの (および理由)
+### 4.2 採用しないもの (および理由)
 
 - `imgui-rs`: docking が upstream にない / Pure Rust ではない / Windows 11 高 DPI で問題が出やすい
-- `iced`: retained mode で MVU に近いが、表のスクロールが苦しい / egui ほど成熟していない
+- `iced`: retained mode で immediate mode 中心の設計と合わない。表のスクロール表示が苦しい
 - `slint`: DSL 学習コスト
 - `tauri`: フロントエンドに Web を要求するため過剰
-- `tokio` / `async-std`: MVU の Cmd は同期実行で十分。非同期ランタイムを引き込むと依存が膨らむ。`crossbeam-channel` と OS スレッドだけで足りる。
+- `tokio` / `async-std`: 非同期ランタイムを引き込むほどの並行処理がない。`std::thread::spawn` + `crossbeam-channel` で十分
+- `mockall`: trait は `Inserter` だけ。テスト時の手書き mock で十分
 
-## 5. Ports & Adapters と MVU の実装パターン
+## 5. 挿入抽象 (Inserter trait)
 
-ここでは hexagonal の **port (trait) → adapter (実装) → application (use case) → runtime (Cmd 実行) → ui_egui (Model/Msg/update/view)** までを、実装パターンとサンプルコードで通します。
+このプロジェクトで**唯一**抽象化する箇所が挿入処理です。alc 経路と Remote Script 経路を切り替える必要が現実にあるため、ここだけ trait を切ります。
 
-### 5.1 Domain 層
+### 5.1 共通型と trait
 
 ```rust
-// crates/domain/src/insertion.rs
+// src/insertion/mod.rs
 
 use std::path::PathBuf;
+use anyhow::Result;
 
 #[derive(Clone, Debug)]
 pub struct InsertionItem {
@@ -760,146 +344,55 @@ pub struct InsertionItem {
 #[derive(Clone, Debug)]
 pub struct InsertionRequest {
     pub items: Vec<InsertionItem>,
-    pub tempo_bpm: f64,
+    pub tempo_bpm: f64,           // .alc は秒→ビート換算に必要、remote はそのまま転送
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InsertionTrigger {
+    /// Enter / ダブルクリック / メニューの "Insert"
     Keyboard,
+    /// アプリ外へのドラッグ開始
     DragStart,
 }
 
 #[derive(Debug)]
 pub enum InsertionOutcome {
+    /// Remote Script 経路で同期挿入完了
     Inserted { count: usize },
+    /// .alc を temp に書き出し、drag-out のペイロードとして返す
     DragPrepared { temp_files: Vec<PathBuf> },
 }
-```
 
-domain は `serde` 以外の依存を持たない。型は不変条件を表すだけで、I/O も非同期も知らない。
-
-### 5.2 Ports 層 (trait 定義)
-
-```rust
-// crates/ports/src/inserter.rs
-use abletonsrtbrowser_domain::insertion::{
-    InsertionRequest, InsertionTrigger, InsertionOutcome,
-};
-use anyhow::Result;
-
-pub trait Inserter: Send {
+pub trait Inserter: Send + Sync {
     fn supports(&self, trigger: InsertionTrigger) -> bool;
     fn insert(&self, req: InsertionRequest, trigger: InsertionTrigger)
         -> Result<InsertionOutcome>;
     fn is_available(&self) -> bool { true }
     fn status_label(&self) -> &'static str;
 }
+
+pub mod alc;
+pub mod remote;
+mod composite;
+pub use composite::Composite;
 ```
 
-```rust
-// crates/ports/src/audio_player.rs
-use std::path::PathBuf;
-use std::time::Duration;
-use anyhow::Result;
-
-#[derive(Clone, Debug)]
-pub struct AudioRange {
-    pub path: PathBuf,
-    pub start: Duration,
-    pub end: Duration,
-}
-
-pub trait AudioPlayer: Send {
-    fn play_ranges(&self, ranges: Vec<AudioRange>) -> Result<()>;
-    fn stop(&self);
-    fn set_volume(&self, pct: u8);
-}
-```
+### 5.2 Composite
 
 ```rust
-// crates/ports/src/live_state.rs
-pub trait LiveStateProvider: Send {
-    fn last_tempo_bpm(&self) -> f64;
-    fn last_cursor_beats(&self) -> f64;
-    fn is_connected(&self) -> bool;
-}
-```
-
-```rust
-// crates/ports/src/srt_repo.rs
-use std::path::Path;
-use abletonsrtbrowser_domain::source::SrtSource;
-use anyhow::Result;
-
-pub trait SrtRepository: Send + Sync {
-    fn load(&self, path: &Path) -> Result<SrtSource>;
-}
-```
-
-```rust
-// crates/ports/src/metadata_store.rs
-use std::path::Path;
-use abletonsrtbrowser_domain::source::{SourceMetadata, SrtSource};
-use anyhow::Result;
-
-pub trait MetadataStore: Send + Sync {
-    fn load(&self, srt_path: &Path) -> Result<Option<SourceMetadata>>;
-    fn save(&self, srt_path: &Path, meta: &SourceMetadata) -> Result<()>;
-}
-```
-
-`SettingsStore`, `LibraryStore`, `AudioMatcher` も同じ形で定義する。
-
-すべての trait は `Send` (runtime のワーカースレッドが所有するため)。読み取りメソッドが多い trait は `Send + Sync` にして `Arc<dyn ...>` で共有できるようにする。
-
-### 5.3 Adapter 層 (port の実装)
-
-`adapter_alc` の例:
-
-```rust
-// crates/adapter_alc/src/lib.rs
-use abletonsrtbrowser_domain::insertion::*;
-use abletonsrtbrowser_ports::inserter::Inserter;
-use anyhow::Result;
-
-pub struct AlcInserter { /* temp_dir: PathBuf, ... */ }
-
-impl AlcInserter {
-    pub fn new() -> Result<Self> { /* ... */ }
-}
-
-impl Inserter for AlcInserter {
-    fn supports(&self, _t: InsertionTrigger) -> bool { true }
-    fn insert(&self, req: InsertionRequest, _t: InsertionTrigger)
-        -> Result<InsertionOutcome>
-    {
-        // .alc を生成して DragPrepared を返す
-        // 詳細は Section 6
-        todo!()
-    }
-    fn status_label(&self) -> &'static str { "alc" }
-}
-```
-
-`adapter_remote` も同様に `Inserter` と `LiveStateProvider` の **2 つの port を実装**する 1 つの adapter。
-
-#### CompositeInserter は app 層に置く
-
-```rust
-// crates/app/src/composite_inserter.rs (合成ルートの一部)
-use abletonsrtbrowser_domain::insertion::*;
-use abletonsrtbrowser_ports::inserter::Inserter;
-use anyhow::Result;
+// src/insertion/composite.rs
 use std::sync::Arc;
+use super::*;
 
-pub struct CompositeInserter {
-    remote: Arc<dyn Inserter>,
-    alc:    Arc<dyn Inserter>,
-    fallback_keyboard_to_alc: bool,
+pub struct Composite {
+    pub remote: Arc<dyn Inserter>,
+    pub alc:    Arc<dyn Inserter>,
+    pub fallback_keyboard_to_alc: bool,
 }
 
-impl Inserter for CompositeInserter {
+impl Inserter for Composite {
     fn supports(&self, _t: InsertionTrigger) -> bool { true }
+
     fn insert(&self, req: InsertionRequest, trigger: InsertionTrigger)
         -> Result<InsertionOutcome>
     {
@@ -916,491 +409,86 @@ impl Inserter for CompositeInserter {
             }
         }
     }
+    fn is_available(&self) -> bool { true }
     fn status_label(&self) -> &'static str {
         if self.remote.is_available() { "remote+alc" } else { "alc-only" }
     }
 }
 ```
 
-合成ルート (app) でしか具体型を知らない。ports 層から見ると `Box<dyn Inserter>` の中身が単一実装か Composite かは無関係。
-
-### 5.4 Application 層 (use case)
+### 5.3 AppState への組み込み
 
 ```rust
-// crates/application/src/insert_items.rs
-use std::sync::Arc;
-use abletonsrtbrowser_domain::insertion::*;
-use abletonsrtbrowser_ports::inserter::Inserter;
-use abletonsrtbrowser_ports::live_state::LiveStateProvider;
-use anyhow::Result;
+// src/main.rs (抜粋)
 
-pub struct InsertItemsUseCase {
-    inserter: Arc<dyn Inserter>,
-    live_state: Arc<dyn LiveStateProvider>,
-}
-
-impl InsertItemsUseCase {
-    pub fn new(inserter: Arc<dyn Inserter>, live_state: Arc<dyn LiveStateProvider>) -> Self {
-        Self { inserter, live_state }
-    }
-
-    pub fn execute(&self, items: Vec<InsertionItem>, trigger: InsertionTrigger)
-        -> Result<InsertionOutcome>
-    {
-        let tempo = self.live_state.last_tempo_bpm();
-        let req = InsertionRequest { items, tempo_bpm: tempo };
-        self.inserter.insert(req, trigger)
-    }
-}
-```
-
-use case は **port を組み合わせて 1 つの意味のある操作を作る**。ここで初めてビジネスロジック (テンポを取って request を組み立てる) が出てくる。
-
-### 5.5 Runtime 層 (Cmd → use case → Msg)
-
-```rust
-// crates/runtime/src/cmd.rs
-use std::path::PathBuf;
-use std::time::Duration;
-use abletonsrtbrowser_domain::insertion::{InsertionItem, InsertionTrigger};
-use abletonsrtbrowser_domain::ids::SourceId;
-
-#[derive(Debug)]
-pub enum Cmd {
-    Nop,
-    LoadSrt(PathBuf),
-    Insert { items: Vec<InsertionItem>, trigger: InsertionTrigger },
-    StartPreview { ranges: Vec<(PathBuf, Duration, Duration)> },
-    StopPreview,
-    SaveMetadata(SourceId),
-    Batch(Vec<Cmd>),
-}
-```
-
-```rust
-// crates/runtime/src/msg_bus.rs
-use crossbeam_channel::{Sender, Receiver, unbounded};
-
-pub struct MsgBus<Msg> {
-    pub tx: Sender<Msg>,
-    pub rx: Receiver<Msg>,
-}
-
-impl<Msg> MsgBus<Msg> {
-    pub fn new() -> Self {
-        let (tx, rx) = unbounded();
-        Self { tx, rx }
-    }
-}
-```
-
-```rust
-// crates/runtime/src/executor.rs
 use std::sync::Arc;
 use crossbeam_channel::{Sender, Receiver, unbounded};
-use abletonsrtbrowser_application::insert_items::InsertItemsUseCase;
-use abletonsrtbrowser_application::load_srt::LoadSrtUseCase;
-use abletonsrtbrowser_application::preview_items::PreviewItemsUseCase;
-use crate::cmd::Cmd;
+use crate::insertion::{Inserter, Composite, alc::AlcInserter, remote::RemoteScriptInserter};
 
-/// UI 層から渡される Msg 型は generic で扱う。
-/// (UI 側で Msg::SrtLoaded(...) などを定義し、ここで生成する)
-pub trait MsgFactory: Send + 'static {
-    type Msg: Send + 'static;
-    fn srt_loaded(&self, src: abletonsrtbrowser_domain::source::SrtSource) -> Self::Msg;
-    fn srt_load_failed(&self, err: String) -> Self::Msg;
-    fn insert_succeeded(&self, count: usize) -> Self::Msg;
-    fn insert_failed(&self, err: String) -> Self::Msg;
-    // ...
-}
-
-pub struct Runtime<F: MsgFactory> {
-    cmd_tx: Sender<Cmd>,
-    msg_tx: Sender<F::Msg>,
-}
-
-impl<F: MsgFactory> Runtime<F> {
-    pub fn spawn(
-        load: Arc<LoadSrtUseCase>,
-        insert: Arc<InsertItemsUseCase>,
-        preview: Arc<PreviewItemsUseCase>,
-        factory: F,
-    ) -> (Self, Receiver<F::Msg>) {
-        let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
-        let (msg_tx, msg_rx) = unbounded::<F::Msg>();
-        let msg_tx_clone = msg_tx.clone();
-
-        std::thread::spawn(move || {
-            for cmd in cmd_rx {
-                handle_cmd(&cmd, &load, &insert, &preview, &factory, &msg_tx_clone);
-            }
-        });
-
-        (Self { cmd_tx, msg_tx }, msg_rx)
-    }
-
-    pub fn dispatch(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.send(cmd);
-    }
-}
-
-fn handle_cmd<F: MsgFactory>(
-    cmd: &Cmd,
-    load: &LoadSrtUseCase,
-    insert: &InsertItemsUseCase,
-    preview: &PreviewItemsUseCase,
-    factory: &F,
-    msg_tx: &Sender<F::Msg>,
-) {
-    match cmd {
-        Cmd::Nop => {}
-        Cmd::Batch(cs) => {
-            for c in cs { handle_cmd(c, load, insert, preview, factory, msg_tx); }
-        }
-        Cmd::LoadSrt(path) => {
-            let msg = match load.execute(path) {
-                Ok(src) => factory.srt_loaded(src),
-                Err(e)  => factory.srt_load_failed(e.to_string()),
-            };
-            let _ = msg_tx.send(msg);
-        }
-        Cmd::Insert { items, trigger } => {
-            let msg = match insert.execute(items.clone(), *trigger) {
-                Ok(outcome) => match outcome {
-                    abletonsrtbrowser_domain::insertion::InsertionOutcome::Inserted { count } =>
-                        factory.insert_succeeded(count),
-                    other => factory.insert_succeeded(0), // DragPrepared は Msg 設計次第
-                },
-                Err(e) => factory.insert_failed(e.to_string()),
-            };
-            let _ = msg_tx.send(msg);
-        }
-        // StartPreview / StopPreview / SaveMetadata も同様
-        _ => {}
-    }
-}
-```
-
-⚠ `Runtime` の Msg 型を generic にしているのは、`runtime` crate が `ui_egui` の `Msg` 型を直接知らずに済むようにするため (依存方向の維持)。`MsgFactory` trait を `ui_egui` 側で実装する。
-
-### 5.6 UI 層 (MVU)
-
-#### Model
-
-```rust
-// crates/ui_egui/src/model.rs
-use std::collections::HashMap;
-use abletonsrtbrowser_domain::source::SrtSource;
-use abletonsrtbrowser_domain::library::Library;
-use abletonsrtbrowser_domain::ids::{SourceId, ItemId, LibraryId};
-use abletonsrtbrowser_domain::filter::Filter;
-
-#[derive(Default)]
-pub struct AppModel {
-    pub mode: ContentMode,
-    pub current_source: Option<SrtSource>,
-    pub libraries: Vec<Library>,
-    pub current_library: Option<LibraryId>,
-    pub selected_items: Vec<ItemId>,
-    pub filter: Filter,
+pub struct AppState {
+    // データ
+    pub source: Option<SrtSource>,
+    pub library: Option<Library>,
+    pub settings: Settings,
     pub filter_text: String,
-    pub hide_speaker_labels: bool,
-    pub favorites_only: bool,
-    pub remote: RemoteStatus,
+    pub selected: Vec<usize>,
+    pub remote_tempo: f64,
+    pub remote_cursor_beats: f64,
     pub toasts: Vec<Toast>,
-    pub layout: LayoutState,
-    pub i18n_lang: Lang,
+    // 副作用窓口
+    pub inserter: Arc<dyn Inserter>,
+    pub player: PreviewPlayer,
+    pub worker_tx: Sender<WorkerCmd>,
+    pub worker_rx: Receiver<WorkerEvent>,
 }
 
-#[derive(Default)]
-pub enum ContentMode { #[default] Source, Library }
-
-#[derive(Default)]
-pub struct RemoteStatus {
-    pub connected: bool,
-    pub last_tempo: f64,
-    pub last_cursor_beats: f64,
+pub enum WorkerCmd {
+    LoadSrt(PathBuf),
+    SaveMetadata(PathBuf, SourceMetadata),
+    InsertViaAlc(InsertionRequest),       // 重い alc 生成をワーカーに逃がす
+    DispatchKeyboardInsert(InsertionRequest),  // 同上 (remote 同期呼出)
 }
-```
 
-#### Msg
-
-```rust
-// crates/ui_egui/src/msg.rs
-use std::path::PathBuf;
-use abletonsrtbrowser_domain::source::SrtSource;
-use abletonsrtbrowser_domain::ids::{SourceId, ItemId};
-use abletonsrtbrowser_domain::insertion::InsertionTrigger;
-
-#[derive(Debug)]
-pub enum Msg {
-    // ユーザ操作起源
-    LoadSrtRequested(PathBuf),
-    SrtClosed,
-    SelectionChanged(Vec<ItemId>),
-    FilterTextChanged(String),
-    FavoritesOnlyToggled,
-    HideSpeakerLabelsToggled,
-    FavoriteToggled(ItemId),
-    TagsEdited(ItemId, Vec<String>),
-    NoteEdited(ItemId, String),
-    GlobalOffsetEdited(i64),
-    GlobalOffsetApplyClicked,
-    GlobalOffsetResetClicked,
-    InsertRequested { trigger: InsertionTrigger },
-    PreviewRequested,
-    PreviewStopRequested,
-    AddSpeakerTagsRequested,
-    LanguageChanged(Lang),
-    PreviewVolumeChanged(u8),
-    LayoutChanged(LayoutDelta),
-
-    // 副作用完了 (runtime 起源)
+pub enum WorkerEvent {
     SrtLoaded(SrtSource),
     SrtLoadFailed(String),
+    AlcReady(Vec<PathBuf>),
     InsertSucceeded { count: usize },
     InsertFailed(String),
-    DragOutPrepared { temp_files: Vec<PathBuf> },
-    PreviewStarted,
-    PreviewEnded,
+    RemoteStateChanged { tempo: f64, cursor_beats: f64 },
     RemoteConnected,
     RemoteDisconnected,
-    RemoteStateChanged { tempo: f64, cursor_beats: f64 },
-    SpeakerTagsAdded { count: usize },
-    SpeakerTagsAlreadyPresent,
-    NoSpeakersFound,
-    MetadataSaved,
-
-    // 内部
-    Tick,                  // 毎フレーム発火 (debounce フラッシュ用)
-    DismissToast(usize),
-}
-```
-
-#### update (純粋関数)
-
-```rust
-// crates/ui_egui/src/update.rs
-use abletonsrtbrowser_runtime::cmd::Cmd;
-use crate::model::*;
-use crate::msg::Msg;
-
-pub fn update(mut model: AppModel, msg: Msg) -> (AppModel, Cmd) {
-    match msg {
-        Msg::LoadSrtRequested(path) => {
-            model.toasts.push(Toast::info("Loading..."));
-            (model, Cmd::LoadSrt(path))
-        }
-        Msg::SrtLoaded(src) => {
-            model.current_source = Some(src);
-            model.selected_items.clear();
-            (model, Cmd::Nop)
-        }
-        Msg::SrtLoadFailed(err) => {
-            model.toasts.push(Toast::error(format!("Load failed: {err}")));
-            (model, Cmd::Nop)
-        }
-        Msg::FavoriteToggled(id) => {
-            if let Some(src) = &mut model.current_source {
-                src.toggle_favorite(id);
-                let source_id = src.id();
-                (model, Cmd::SaveMetadata(source_id))    // 副作用は Cmd で逃がす
-            } else {
-                (model, Cmd::Nop)
-            }
-        }
-        Msg::InsertRequested { trigger } => {
-            let items = model.build_insertion_items();
-            (model, Cmd::Insert { items, trigger })
-        }
-        Msg::InsertSucceeded { count } => {
-            model.toasts.push(Toast::success(format!("Inserted {count} clip(s).")));
-            (model, Cmd::Nop)
-        }
-        Msg::InsertFailed(err) => {
-            model.toasts.push(Toast::error(err));
-            (model, Cmd::Nop)
-        }
-        Msg::DragOutPrepared { temp_files } => {
-            // ここは Cmd として逃がしても良いが、egui の場合は
-            // view 側で raw_window_handle 経由で叩く必要があり、
-            // model にフラグを立てて view 側で消費するパターンが現実的。
-            model.pending_drag_files = Some(temp_files);
-            (model, Cmd::Nop)
-        }
-        Msg::RemoteStateChanged { tempo, cursor_beats } => {
-            model.remote.last_tempo = tempo;
-            model.remote.last_cursor_beats = cursor_beats;
-            (model, Cmd::Nop)
-        }
-        Msg::Tick => {
-            // 永続化の debounce フラッシュ判定など
-            (model, Cmd::Nop)
-        }
-        // ... 他もすべてここに集約
-        _ => (model, Cmd::Nop),
-    }
-}
-```
-
-#### view (Vec<Msg> を返す)
-
-```rust
-// crates/ui_egui/src/view/item_table.rs
-use egui::Ui;
-use crate::model::AppModel;
-use crate::msg::Msg;
-use abletonsrtbrowser_domain::insertion::InsertionTrigger;
-
-pub fn view(model: &AppModel, ui: &mut Ui) -> Vec<Msg> {
-    let mut msgs = vec![];
-
-    // 検索ボックス
-    let mut buf = model.filter_text.clone();
-    if ui.text_edit_singleline(&mut buf).changed() {
-        msgs.push(Msg::FilterTextChanged(buf));
-    }
-
-    // テーブル本体
-    egui_extras::TableBuilder::new(ui)
-        .column(/* ... */)
-        .body(|body| {
-            body.rows(20.0, model.filtered_items().len(), |row_idx, mut row| {
-                let item = &model.filtered_items()[row_idx];
-                row.col(|ui| {
-                    let resp = ui.selectable_label(
-                        model.is_selected(item.id), &item.text);
-                    if resp.clicked() {
-                        msgs.push(Msg::SelectionChanged(vec![item.id]));
-                    }
-                    if resp.double_clicked() {
-                        msgs.push(Msg::InsertRequested {
-                            trigger: InsertionTrigger::Keyboard,
-                        });
-                    }
-                    if resp.drag_started_by(egui::PointerButton::Primary) {
-                        msgs.push(Msg::InsertRequested {
-                            trigger: InsertionTrigger::DragStart,
-                        });
-                    }
-                });
-            });
-        });
-
-    msgs
-}
-```
-
-#### eframe との接続 (runtime_glue)
-
-```rust
-// crates/ui_egui/src/runtime_glue.rs
-use crossbeam_channel::Receiver;
-use eframe::App;
-use egui::Context;
-use abletonsrtbrowser_runtime::cmd::Cmd;
-
-use crate::model::AppModel;
-use crate::msg::Msg;
-use crate::update::update;
-
-pub struct EframeApp {
-    model: AppModel,
-    msg_rx: Receiver<Msg>,
-    runtime: Box<dyn Fn(Cmd)>,        // Cmd を runtime に流す閉包
 }
 
-impl EframeApp {
-    pub fn new(model: AppModel, msg_rx: Receiver<Msg>, runtime: Box<dyn Fn(Cmd)>) -> Self {
-        Self { model, msg_rx, runtime }
-    }
-
-    fn drain_external(&mut self) {
-        while let Ok(msg) = self.msg_rx.try_recv() {
-            self.apply(msg);
-        }
-    }
-
-    fn apply(&mut self, msg: Msg) {
-        let model = std::mem::take(&mut self.model);
-        let (next, cmd) = update(model, msg);
-        self.model = next;
-        (self.runtime)(cmd);
-    }
-}
-
-impl App for EframeApp {
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // 1) 外部から飛んできた Msg をすべて消化
-        self.drain_external();
-        // 2) Tick (debounce フラッシュ用)
-        self.apply(Msg::Tick);
-        // 3) view → Vec<Msg> を集める
-        let mut collected: Vec<Msg> = vec![];
-        egui::CentralPanel::default().show(ctx, |ui| {
-            collected.extend(crate::view::root::view(&self.model, ui));
-        });
-        // 4) View からの Msg をひとつずつ apply
-        for msg in collected { self.apply(msg); }
-        // 5) 連続描画
-        ctx.request_repaint();
-    }
-}
-```
-
-### 5.7 合成ルート (app/main.rs)
-
-```rust
-// crates/app/src/main.rs
-use std::sync::Arc;
-use anyhow::Result;
-use abletonsrtbrowser_adapter_alc::AlcInserter;
-use abletonsrtbrowser_adapter_remote::RemoteScriptInserter;
-use abletonsrtbrowser_adapter_audio_rodio::RodioPlayer;
-use abletonsrtbrowser_adapter_persistence_fs::FsPersistence;
-use abletonsrtbrowser_adapter_srt_parser::SrtParser;
-use abletonsrtbrowser_application::{
-    insert_items::InsertItemsUseCase,
-    load_srt::LoadSrtUseCase,
-    preview_items::PreviewItemsUseCase,
-};
-use abletonsrtbrowser_runtime::{cmd::Cmd, executor::Runtime};
-use abletonsrtbrowser_ui_egui::{model::AppModel, msg::Msg, runtime_glue::EframeApp};
-
-mod composite_inserter;
-mod ui_msg_factory;     // impl MsgFactory<Msg = Msg>
-
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // --- 1) Adapter を組み立てる ---
+    // 1) Inserter を組み立てる
     let alc    = Arc::new(AlcInserter::new()?);
     let remote = Arc::new(RemoteScriptInserter::new("127.0.0.1:19823".parse()?));
-    let composite = Arc::new(composite_inserter::CompositeInserter::new(
-        remote.clone(), alc.clone(), true,
-    ));
-    let player    = Arc::new(RodioPlayer::new(90)?);
-    let fs_persist = Arc::new(FsPersistence::default_path()?);
-    let srt_parser = Arc::new(SrtParser::default());
+    let inserter: Arc<dyn Inserter> = Arc::new(Composite {
+        remote: remote.clone(),
+        alc: alc.clone(),
+        fallback_keyboard_to_alc: true,
+    });
 
-    // --- 2) Use case を組み立てる ---
-    let load_uc    = Arc::new(LoadSrtUseCase::new(srt_parser.clone(), fs_persist.clone()));
-    let insert_uc  = Arc::new(InsertItemsUseCase::new(composite.clone(), remote.clone()));
-    let preview_uc = Arc::new(PreviewItemsUseCase::new(player.clone()));
+    // 2) ワーカースレッド起動
+    let (worker_tx, worker_cmd_rx) = unbounded::<WorkerCmd>();
+    let (worker_event_tx, worker_rx) = unbounded::<WorkerEvent>();
+    {
+        let inserter = inserter.clone();
+        std::thread::spawn(move || {
+            for cmd in worker_cmd_rx {
+                handle_worker_cmd(cmd, &inserter, &worker_event_tx);
+            }
+        });
+    }
 
-    // --- 3) Runtime と Msg チャネル ---
-    let factory = ui_msg_factory::UiMsgFactory;
-    let (runtime, msg_rx) =
-        Runtime::spawn(load_uc, insert_uc, preview_uc, factory);
-    let runtime_arc = Arc::new(runtime);
-    let dispatch: Box<dyn Fn(Cmd)> = {
-        let r = runtime_arc.clone();
-        Box::new(move |cmd| r.dispatch(cmd))
-    };
+    // 3) Remote のイベント (tempo/cursor) を WorkerEvent に転送するスレッド
+    //    (RemoteScriptInserter の subscribe コールバックに worker_event_tx を渡す)
 
-    // --- 4) eframe で UI 起動 ---
-    let initial_model = AppModel::default();
-    let app = EframeApp::new(initial_model, msg_rx, dispatch);
+    // 4) AppState 組み立て & eframe 起動
+    let app = AppState::new(inserter, worker_tx, worker_rx)?;
     let opts = eframe::NativeOptions::default();
     eframe::run_native("AbletonSRTBrowser", opts, Box::new(|_cc| Box::new(app)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1408,57 +496,107 @@ fn main() -> Result<()> {
 }
 ```
 
-合成ルートだけが具体型 (`AlcInserter`, `RemoteScriptInserter`, `RodioPlayer`, ...) を知っている。それ以外の crate はすべて trait 越しのやり取り。
+### 5.4 GUI からの呼び出し
 
-### 5.8 テスト容易性
-
-#### Application 層のテスト (mockall)
+view 関数は `&mut AppState` を直接ミューテーションする素朴なスタイル:
 
 ```rust
-// crates/application/src/insert_items.rs (#[cfg(test)] 内)
-use mockall::predicate::*;
-use mockall::mock;
-use abletonsrtbrowser_ports::inserter::Inserter;
-use abletonsrtbrowser_ports::live_state::LiveStateProvider;
+// src/ui.rs (抜粋)
 
-mock! {
-    pub Ins {}
-    impl Inserter for Ins {
-        fn supports(&self, t: InsertionTrigger) -> bool;
-        fn insert(&self, req: InsertionRequest, t: InsertionTrigger) -> Result<InsertionOutcome>;
-        fn is_available(&self) -> bool;
-        fn status_label(&self) -> &'static str;
+pub fn item_table(ui: &mut egui::Ui, app: &mut AppState) {
+    egui_extras::TableBuilder::new(ui)
+        .column(/* ... */)
+        .body(|body| {
+            body.rows(20.0, app.filtered_items().len(), |row_idx, mut row| {
+                let item_idx = app.filtered_index(row_idx);
+                row.col(|ui| {
+                    let label = &app.source.as_ref().unwrap().items[item_idx].text;
+                    let resp = ui.selectable_label(app.is_selected(item_idx), label);
+
+                    if resp.clicked() {
+                        app.set_single_selection(item_idx);
+                    }
+                    if resp.double_clicked() {
+                        // キーボード挿入 (Remote 経由 / fallback で alc)
+                        if let Err(e) = app.dispatch_keyboard_insert() {
+                            app.toast_error(e.to_string());
+                        }
+                    }
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        // alc 生成 → drag-out
+                        if let Err(e) = app.start_drag_out_for(item_idx) {
+                            app.toast_error(e.to_string());
+                        }
+                    }
+                });
+            });
+        });
+}
+```
+
+`AppState` 上のメソッドは内部で `self.inserter.insert(req, trigger)` か `self.worker_tx.send(WorkerCmd::...)` を選んで呼ぶ。重い処理はワーカー、軽いものは同期で OK。
+
+### 5.5 eframe::App での周回
+
+```rust
+impl eframe::App for AppState {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 1) ワーカーからのイベントを drain
+        while let Ok(ev) = self.worker_rx.try_recv() {
+            self.handle_worker_event(ev);
+        }
+        // 2) ショートカット
+        crate::ui::shortcuts::handle(ctx, self);
+        // 3) view (関数群が &mut self を直接いじる)
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| crate::ui::menu_bar(ui, self));
+        egui::SidePanel::left("left").show(ctx, |ui| crate::ui::source_pane(ui, self));
+        egui::TopBottomPanel::bottom("detail").show(ctx, |ui| crate::ui::detail_pane(ui, self));
+        egui::CentralPanel::default().show(ctx, |ui| crate::ui::item_table(ui, self));
+        // 4) debounce フラッシュ判定
+        self.flush_debounced_persistence();
+        // 5) 描画継続 (Live イベントを取り続けるため)
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+```
+
+### 5.6 テスト容易性
+
+```rust
+// src/insertion/mod.rs (#[cfg(test)])
+pub struct MockInserter {
+    pub calls: std::sync::Mutex<Vec<(InsertionRequest, InsertionTrigger)>>,
+    pub available: bool,
+}
+
+impl Inserter for MockInserter {
+    fn supports(&self, _t: InsertionTrigger) -> bool { true }
+    fn is_available(&self) -> bool { self.available }
+    fn status_label(&self) -> &'static str { "mock" }
+    fn insert(&self, req: InsertionRequest, t: InsertionTrigger) -> Result<InsertionOutcome> {
+        self.calls.lock().unwrap().push((req.clone(), t));
+        Ok(InsertionOutcome::Inserted { count: req.items.len() })
     }
 }
 
 #[test]
-fn use_case_passes_request_to_port() {
-    let mut ins = MockIns::new();
-    ins.expect_insert()
-       .withf(|req, _| req.tempo_bpm == 120.0)
-       .returning(|_, _| Ok(InsertionOutcome::Inserted { count: 3 }));
-    // ... LiveStateProvider も mock して 120.0 を返させる
-    let uc = InsertItemsUseCase::new(Arc::new(ins), /* mock */);
-    let outcome = uc.execute(vec![/* ... */], InsertionTrigger::Keyboard).unwrap();
-    matches!(outcome, InsertionOutcome::Inserted { count: 3 });
+fn composite_routes_drag_to_alc() {
+    let alc    = Arc::new(MockInserter { calls: Default::default(), available: true });
+    let remote = Arc::new(MockInserter { calls: Default::default(), available: true });
+    let c = Composite {
+        remote: remote.clone(),
+        alc: alc.clone(),
+        fallback_keyboard_to_alc: true,
+    };
+    c.insert(req(), InsertionTrigger::DragStart).unwrap();
+    assert_eq!(alc.calls.lock().unwrap().len(), 1);
+    assert_eq!(remote.calls.lock().unwrap().len(), 0);
 }
 ```
 
-#### MVU update 関数のテスト
+`MockInserter` は手書き 10 行程度。`mockall` を入れる必要なし。
 
-```rust
-// crates/ui_egui/src/update.rs (#[cfg(test)])
-#[test]
-fn favorite_toggle_emits_save_metadata_cmd() {
-    let model = AppModel::default()
-        .with_source(some_source());
-    let (next, cmd) = update(model, Msg::FavoriteToggled(ItemId(0)));
-    assert!(next.current_source.unwrap().items[0].favorite);
-    matches!(cmd, Cmd::SaveMetadata(_));
-}
-```
-
-副作用のない pure 関数なので **入出力テストだけで済む**。view (egui のレンダリング) は基本的にテストしない。
+純粋関数 (SRT パース、話者抽出、フィルタマッチング、alc XML 生成) はそれぞれのモジュール内で `#[cfg(test)]` ユニットテストを書く。`AppState` の view 統合テストは基本やらない (egui が immediate-mode で副作用が広く、コストに見合わない)。
 
 ## 6. `.alc` バックエンド
 
@@ -3254,8 +2392,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
-      - run: cargo build --workspace --release
+      - run: cargo test
+      - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           name: abletonsrtbrowser-${{ matrix.os }}
@@ -3358,12 +2496,14 @@ jobs:
 
 - [ ] `srt::parse_srt` は BOM / CRLF / LF を正しく扱う
 - [ ] `srt::parse_srt` は `,` `.` 両方の小数点記法を受ける
-- [ ] `speaker::split_speaker` は `(話者)` `（話者）` 両方を抽出
-- [ ] `audio_match::auto_match_audio` は完全一致を優先する
-- [ ] `audio_match::auto_match_audio` は最短ファイル名で安定ソート
-- [ ] `filter::Filter::parse` は `-tag` を exclude_tags に入れる
-- [ ] `filter::matches` は exclude_tags が AND で効く
+- [ ] `srt::split_speaker` は `(話者)` `（話者）` 両方を抽出
+- [ ] `srt::auto_match_audio` は完全一致を優先する
+- [ ] `srt::auto_match_audio` は最短ファイル名で安定ソート
+- [ ] `Filter::parse` は `-tag` を exclude_tags に入れる
+- [ ] `Filter::matches` は exclude_tags が AND で効く
 - [ ] `metadata::merge_meta` はキー (index,start,end,text) で同定する
+- [ ] `insertion::Composite` が DragStart を alc に、Keyboard を remote にルートする
+- [ ] `insertion::Composite` が remote 切断時に Keyboard を alc にフォールバックする
 
 ### 16.2 .alc バックエンド
 
