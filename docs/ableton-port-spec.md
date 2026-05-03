@@ -42,25 +42,28 @@
 
 ## 2. 全体アーキテクチャ
 
-本プロジェクトは **Hexagonal (Ports & Adapters) Architecture** を Rust の Cargo workspace で実現し、UI 層は **MVU (Model-View-Update) スタイルのメッセージパッシング**で動かします。これにより、
+本プロジェクトは **Hexagonal (Ports & Adapters) Architecture** の論理設計を採用しつつ、物理的には **単一クレート + モジュール階層** で実現します。レイヤ境界は Rust の `mod` ツリーと可視性 (`pub(crate)` / `pub(super)`) で表現し、Cargo workspace のオーバーヘッドを払いません。UI 層は **MVU (Model-View-Update) スタイル**を採り、副作用と状態変化を明確に分離します。
 
-- ドメインロジックが I/O・GUI・DAW 連携と完全に独立する
+これにより:
+
+- ドメインロジックが I/O・GUI・DAW 連携と独立する (層を跨ぐ依存はモジュール階層と code review で守る)
 - 挿入経路 (.alc / Remote Script) や永続化先を差し替えてもコアが変わらない
-- UI と副作用が明確に分離され、テスト容易性が高い
+- UI と副作用が分離され、テスト容易性が高い
+- Cargo.toml 1 個・`cargo build` 1 回で完結。将来クレート分割が必要になったら、各レイヤのモジュールをそのまま `crates/` 配下に切り出せばよい
 
 ### 2.1 レイヤ構成 (Hexagonal)
 
 ```
                     ┌──────────────────────────┐
-                    │      app (binary)         │   ← 合成ルート (Composition Root)
+                    │      app (main.rs)        │   ← 合成ルート (Composition Root)
                     │   全 adapter を組み立て   │
                     └────────────┬──────────────┘
                                  │ 依存
             ┌────────────────────┼────────────────────┐
             ▼                    ▼                    ▼
      ┌────────────┐        ┌──────────┐        ┌────────────┐
-     │  ui_egui   │        │ runtime  │        │  adapters  │
-     │  (MVU)     │        │ (Cmd 実行)│        │ (実装)     │
+     │ ui (MVU)   │        │ runtime  │        │  adapter   │
+     │            │        │ (Cmd 実行)│        │ (実装)     │
      └─────┬──────┘        └────┬─────┘        └─────┬──────┘
            │                    │                    │
            │                    ▼                    │
@@ -81,19 +84,34 @@
                           └──────────┘
 ```
 
-**依存の方向は外→内のみ**。`domain` は何にも依存せず、`ports` は `domain` のみ、`adapters` と `application` は `domain` + `ports` のみに依存します。逆方向の依存 (例: domain が adapter を知る) は禁止。
+**依存の方向は外→内のみ**。`domain` は何にも依存せず、`ports` は `domain` のみ、`application` と `adapter::*` は `domain` + `ports` のみに依存します。逆方向 (domain が adapter を知る等) は禁止。
 
-| 層 | 役割 | 例 |
+| モジュール | 役割 | 例 |
 |----|------|------|
-| `domain` | 不変条件を持つ純粋なドメイン型 | `SrtItem`, `SrtSource`, `Filter`, `Library`, `ItemId` |
-| `ports` | 外界とのやり取りの抽象 (trait のみ) | `Inserter`, `AudioPlayer`, `MetadataStore`, `SrtRepository` |
-| `application` | use case (port を組み合わせて意味のある操作を実行) | `LoadSrtUseCase`, `InsertItemsUseCase`, `AddSpeakerTagsUseCase` |
-| `adapters` | port の具体実装 (技術選定を内包) | `adapter_alc`, `adapter_remote`, `adapter_audio_rodio`, `adapter_persistence_fs` |
-| `ui_egui` | egui ベースの View + MVU の Model/Msg/update | `AppModel`, `Msg`, `update`, `view::*` |
-| `runtime` | UI からの `Cmd` を受けて application を呼び、結果を `Msg` で返す | `Runtime::dispatch(cmd)` |
-| `app` | バイナリ。全 adapter を構築して runtime と UI を起動 | `main.rs` |
+| `crate::domain` | 不変条件を持つ純粋なドメイン型 | `SrtItem`, `SrtSource`, `Filter`, `Library`, `ItemId` |
+| `crate::ports` | 外界とのやり取りの抽象 (trait のみ) | `Inserter`, `AudioPlayer`, `MetadataStore`, `SrtRepository` |
+| `crate::application` | use case (port を組み合わせて意味のある操作を実行) | `LoadSrtUseCase`, `InsertItemsUseCase`, `AddSpeakerTagsUseCase` |
+| `crate::adapter::*` | port の具体実装 (技術選定を内包) | `adapter::alc`, `adapter::remote`, `adapter::audio_rodio`, `adapter::persistence_fs` |
+| `crate::ui` | egui ベースの View + MVU の Model/Msg/update | `AppModel`, `Msg`, `update`, `view::*` |
+| `crate::runtime` | UI からの `Cmd` を受けて application を呼び、結果を `Msg` で返す | `Runtime::dispatch(cmd)` |
+| `crate::app` (= `main.rs`) | バイナリ。全 adapter を構築して runtime と UI を起動 | `main()` |
 
-### 2.2 MVU ループ (UI 層)
+### 2.2 レイヤ境界の運用ルール (Rust の機能で表現できる範囲)
+
+Rust のモジュールはコンパイラレベルで「モジュール A はモジュール B を import 禁止」とは強制できません。代わりに以下の規約で運用します:
+
+1. **`mod.rs` での再エクスポートを最小化**。`crate::domain::*` で全部見えるような `pub use` をしない。各モジュールは必要なものだけ `pub` で公開
+2. **下位レイヤから上位レイヤを `use` しない** ことを code review でチェック。具体的には:
+   - `domain/*.rs` のどこにも `use crate::adapter::` `use crate::ui::` `use crate::application::` `use crate::ports::` が出ない
+   - `ports/*.rs` には `use crate::domain::` のみ
+   - `adapter/*.rs` と `application/*.rs` には `use crate::domain::` と `use crate::ports::` のみ
+3. **CI で grep ベースのチェックを足す** (任意):
+   ```bash
+   ! grep -rn "use crate::adapter\|use crate::ui\|use crate::runtime" src/domain src/ports
+   ```
+4. **`pub(crate)` を積極的に使う**。adapter の内部型が UI から触れないようにする
+
+### 2.3 MVU ループ (UI 層)
 
 UI は **immediate mode (egui) を MVU の View として扱う**。「View が直接モデルを書き換える」のではなく「View は `Msg` を返すだけ」とすることで、状態変化が `update` 関数に集約されます。
 
@@ -180,215 +198,217 @@ pub fn view(model: &AppModel, ui: &mut egui::Ui) -> Vec<Msg>  { /* pure-ish */ }
 3. **`view` はモデルから `Vec<Msg>` を返す**。egui の `Response` から発火した Msg を集めるだけで、モデルを直接ミューテーションしない。
 4. **副作用の結果も `Msg` として戻ってくる**。すべての状態変化は `update` の単一の入口を通る。
 
-### 2.3 並行モデル
+### 2.4 並行モデル
 
 - **メインスレッド**: egui 描画 + MVU の `view` / `update` ループ
-- **runtime のワーカースレッド**: `Cmd` を受け取り、application 経由で adapter を叩く。完了結果を `mpsc::Sender<Msg>` でメインに流す
-- **rodio**: 内部で再生スレッドを持つので、`adapter_audio_rodio` 内に隠蔽。runtime から見ると `play` / `stop` の同期メソッド呼出
-- **Remote Script クライアント**: 接続・購読のための専用スレッド 1 本 (`adapter_remote` 内)。Live からのイベント (tempo / song_time など) を `Msg::RemoteStateChanged` に変換して runtime チャネルに投げる
+- **runtime のワーカースレッド**: `Cmd` を受け取り、application 経由で adapter を叩く。完了結果を `crossbeam_channel::Sender<Msg>` でメインに流す
+- **rodio**: 内部で再生スレッドを持つので、`adapter::audio_rodio` 内に隠蔽。runtime から見ると `play` / `stop` の同期メソッド呼出
+- **Remote Script クライアント**: 接続・購読のための専用スレッド 1 本 (`adapter::remote` 内)。Live からのイベント (tempo / song_time など) を `Msg::RemoteStateChanged` に変換して runtime チャネルに投げる
 - **ファイル監視 (任意)**: `notify` クレートで別スレッド
 
 ロックを共有しない設計 (model はメインスレッド専有、副作用は Cmd / Msg で往復) なので、`Arc<Mutex<...>>` の出番はほぼない。
 
-### 2.4 ディスク IO
+### 2.5 ディスク IO
 
 - **設定 / メタデータの書き込み**: 小サイズなのでメインスレッドで debounce 後に同期書き込みでも問題なし。気になるなら `Cmd::SaveMetadata(SourceId)` 経由で runtime に逃がす
 - **SRT 一括読み込み (ライブラリ起動時)**: `Cmd::LoadSrt(...)` を投げて runtime のワーカースレッドで処理、進捗を `Msg::LoadProgress(..)` で返す
 
-### 2.5 テスト戦略
+### 2.6 テスト戦略
 
 | 層 | テスト | ポイント |
 |----|--------|---------|
 | `domain` | ピュアな関数のユニットテスト | I/O 不要 |
-| `ports` | trait 自体はテスト対象外 | mock 用に `MockInserter` などを `application` の dev-dependency に置く |
-| `application` | use case のユニットテスト (mock port を注入) | port 越しに副作用を観察 |
-| `adapters` | 統合テスト (実 I/O を伴う) | `tempfile` で隔離 |
-| `ui_egui` | `update` 関数のスナップショットテスト | `view` は `egui::Context` のヘッドレスモードで実行可能 |
-| `app` | 起動 / 接続テスト | `cargo run --release` の手動確認
+| `ports` | trait 自体はテスト対象外 | mock は `application` のテスト内に手書きで置く (`mockall` は使わずに OK) |
+| `application` | use case のユニットテスト (手書き mock port を注入) | port 越しに副作用を観察 |
+| `adapter::*` | 統合テスト (実 I/O を伴う) | `tempfile` で隔離 |
+| `ui` | `update` 関数のスナップショットテスト | `view` は基本テストしない |
+| `app` (`main.rs`) | 起動 / 接続テスト | `cargo run --release` の手動確認 |
 
-## 3. リポジトリ構成 (Cargo workspace)
+単一クレートなので `tests/` 配下の統合テストもクレート全体にアクセス可能。MVU の `update` も `#[cfg(test)]` で隣のモジュールから直接叩ける。
 
-Hexagonal の各層を **個別の crate** に分け、Cargo workspace でまとめます。crate 単位で依存方向を強制できるので、誤って domain が adapter を import するような事故が **コンパイラレベルで防げる**のが最大のメリット。
+## 3. リポジトリ構成 (単一クレート + レイヤモジュール)
+
+Hexagonal の各層を **`src/` 配下のサブモジュール** で表現します。Cargo は単一クレート構成。Cargo.toml も `lib.rs` も 1 個。
 
 ```
 abletonsrtbrowser/
-├── Cargo.toml                       # workspace ルート
+├── Cargo.toml
 ├── README.md
 ├── LICENSE
+├── build.rs                         # Windows のアイコン埋め込み
 ├── crates/
-│   ├── domain/                      # 依存ゼロ。pure types
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── ids.rs               # SourceId, ItemId, LibraryId, FolderId
-│   │       ├── srt.rs               # SrtItem, ItemKey
-│   │       ├── source.rs            # SrtSource, ItemMeta
-│   │       ├── library.rs           # Library, LibFolder
-│   │       ├── filter.rs            # Filter (検索条件のみ。マッチング関数も含む)
-│   │       ├── insertion.rs         # InsertionItem, InsertionRequest, InsertionTrigger
-│   │       └── audio_range.rs       # AudioRange (file + start + end)
-│   │
-│   ├── ports/                       # → domain
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── inserter.rs          # trait Inserter
-│   │       ├── audio_player.rs      # trait AudioPlayer
-│   │       ├── srt_repo.rs          # trait SrtRepository (SRT パース + ロード)
-│   │       ├── audio_matcher.rs     # trait AudioMatcher
-│   │       ├── metadata_store.rs    # trait MetadataStore (per-source JSON)
-│   │       ├── settings_store.rs    # trait SettingsStore
-│   │       ├── library_store.rs     # trait LibraryStore
-│   │       └── live_state.rs        # trait LiveStateProvider (tempo, cursor 取得)
-│   │
-│   ├── application/                 # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── load_srt.rs          # use case: SRT 読込 + メタデータマージ
-│   │       ├── insert_items.rs      # use case: 挿入 (Inserter 経由)
-│   │       ├── preview_items.rs     # use case: プレビュー再生
-│   │       ├── update_metadata.rs   # use case: タグ・お気に入り編集
-│   │       ├── add_speaker_tags.rs  # use case: 話者タグ自動追加
-│   │       ├── apply_offset.rs      # use case: Global Offset 適用
-│   │       └── library_ops.rs       # use case: ライブラリ追加/削除/フォルダ操作
-│   │
-│   ├── adapter_alc/                 # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs               # impl Inserter for AlcInserter
-│   │       ├── xml.rs               # XML テンプレート組み立て
-│   │       └── temp_dir.rs          # 一時ファイルの GC
-│   │
-│   ├── adapter_remote/              # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs               # impl Inserter, impl LiveStateProvider
-│   │       ├── client.rs            # TCP+JSON クライアント
-│   │       ├── protocol.rs          # OutMsg / InMsg 定義 (serde)
-│   │       └── reconnect.rs         # 接続管理ワーカ
-│   │
-│   ├── adapter_audio_rodio/         # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       └── lib.rs               # impl AudioPlayer (rodio + symphonia)
-│   │
-│   ├── adapter_persistence_fs/      # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs               # impl MetadataStore / SettingsStore / LibraryStore
-│   │       ├── atomic.rs            # atomic write (tmp + rename)
-│   │       ├── path_hash.rs         # SHA-256 ベースのファイル名生成
-│   │       └── schema.rs            # 永続化 JSON スキーマ (serde)
-│   │
-│   ├── adapter_srt_parser/          # → domain, ports
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs               # impl SrtRepository / AudioMatcher
-│   │       ├── parser.rs            # SRT パーサ (BOM, CRLF 対応)
-│   │       ├── speaker.rs           # 話者ラベル抽出
-│   │       └── matcher.rs           # 自動オーディオマッチング
-│   │
-│   ├── runtime/                     # → application, ports, domain
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── cmd.rs               # Cmd enum
-│   │       ├── msg_bus.rs           # MVU 用の mpsc 双方向チャネル
-│   │       └── executor.rs          # Cmd → use case 呼出 → Msg 戻し
-│   │
-│   ├── ui_egui/                     # → domain, runtime (Cmd/Msg 利用)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── model.rs             # AppModel
-│   │       ├── msg.rs               # Msg enum
-│   │       ├── update.rs            # update(model, msg) -> (model, Cmd)
-│   │       ├── runtime_glue.rs      # eframe::App 実装、毎フレーム drain → update → view
-│   │       ├── i18n/
-│   │       │   ├── mod.rs
-│   │       │   ├── en.rs
-│   │       │   └── ja.rs
-│   │       ├── view/
-│   │       │   ├── mod.rs           # ペイン分割 (TopBottomPanel + SidePanel)
-│   │       │   ├── menu.rs
-│   │       │   ├── source_pane.rs
-│   │       │   ├── library_pane.rs
-│   │       │   ├── item_table.rs    # egui_extras::TableBuilder
-│   │       │   ├── detail_pane.rs
-│   │       │   ├── dialogs.rs
-│   │       │   ├── toasts.rs
-│   │       │   └── shortcuts.rs
-│   │       └── drag_out.rs          # drag クレートとの統合 (winit raw handle 必須)
-│   │
-│   ├── app/                         # バイナリ (composition root)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       └── main.rs              # 全 adapter を構築 → Runtime → UI 起動
-│   │
-│   └── remote_script/               # Python パッケージ (workspace 外)
+│   └── remote_script/               # Python (Cargo の管理外)
 │       ├── README.md
 │       ├── __init__.py
 │       ├── manager.py
 │       ├── server.py
 │       └── handlers.py
+├── src/
+│   ├── main.rs                      # 合成ルート: 全 adapter を構築 → Runtime → UI 起動
+│   ├── lib.rs                       # mod 宣言のみ (テストから使う)
+│   │
+│   ├── domain/                      # 依存ゼロ。pure types。I/O / GUI を一切知らない
+│   │   ├── mod.rs
+│   │   ├── ids.rs                   # SourceId, ItemId, LibraryId, FolderId
+│   │   ├── srt.rs                   # SrtItem, ItemKey
+│   │   ├── source.rs                # SrtSource, ItemMeta, SourceMetadata
+│   │   ├── library.rs               # Library, LibFolder
+│   │   ├── filter.rs                # Filter
+│   │   ├── insertion.rs             # InsertionItem, InsertionRequest, InsertionTrigger, InsertionOutcome
+│   │   └── audio_range.rs           # AudioRange (file + start + end)
+│   │
+│   ├── ports/                       # trait のみ。`use crate::domain::*` だけ許容
+│   │   ├── mod.rs
+│   │   ├── inserter.rs              # trait Inserter
+│   │   ├── audio_player.rs          # trait AudioPlayer
+│   │   ├── srt_repo.rs              # trait SrtRepository
+│   │   ├── audio_matcher.rs         # trait AudioMatcher
+│   │   ├── metadata_store.rs        # trait MetadataStore
+│   │   ├── settings_store.rs        # trait SettingsStore
+│   │   ├── library_store.rs         # trait LibraryStore
+│   │   └── live_state.rs            # trait LiveStateProvider
+│   │
+│   ├── application/                 # use case。`use crate::{domain, ports}::*` のみ
+│   │   ├── mod.rs
+│   │   ├── load_srt.rs              # LoadSrtUseCase
+│   │   ├── insert_items.rs          # InsertItemsUseCase
+│   │   ├── preview_items.rs         # PreviewItemsUseCase
+│   │   ├── update_metadata.rs       # UpdateMetadataUseCase
+│   │   ├── add_speaker_tags.rs      # AddSpeakerTagsUseCase
+│   │   ├── apply_offset.rs          # ApplyOffsetUseCase
+│   │   └── library_ops.rs           # LibraryOpsUseCase
+│   │
+│   ├── adapter/                     # 各 port の実装。`use crate::{domain, ports}::*` のみ
+│   │   ├── mod.rs
+│   │   ├── alc/
+│   │   │   ├── mod.rs               # impl Inserter for AlcInserter
+│   │   │   ├── xml.rs
+│   │   │   └── temp_dir.rs
+│   │   ├── remote/
+│   │   │   ├── mod.rs               # impl Inserter, impl LiveStateProvider
+│   │   │   ├── client.rs            # TCP+JSON クライアント
+│   │   │   ├── protocol.rs          # serde 型
+│   │   │   └── reconnect.rs
+│   │   ├── audio_rodio.rs           # impl AudioPlayer (rodio + symphonia)
+│   │   ├── persistence_fs.rs        # impl MetadataStore / SettingsStore / LibraryStore
+│   │   ├── srt_parser.rs            # impl SrtRepository / AudioMatcher
+│   │   └── composite_inserter.rs    # 合成: alc + remote をラップ
+│   │
+│   ├── runtime/                     # MVU runtime。`use crate::{application, domain}::*` を使う
+│   │   ├── mod.rs
+│   │   ├── cmd.rs                   # Cmd enum
+│   │   ├── msg_bus.rs               # crossbeam チャネルのラッパ
+│   │   └── executor.rs              # Cmd → use case 呼出 → Msg 戻し
+│   │
+│   ├── ui/                          # MVU の Model/Msg/update + egui view
+│   │   ├── mod.rs
+│   │   ├── model.rs                 # AppModel
+│   │   ├── msg.rs                   # Msg enum
+│   │   ├── update.rs                # update(model, msg) -> (model, Cmd)
+│   │   ├── runtime_glue.rs          # eframe::App 実装、毎フレーム drain → update → view
+│   │   ├── drag_out.rs              # drag クレートとの統合
+│   │   ├── i18n/
+│   │   │   ├── mod.rs
+│   │   │   ├── en.rs
+│   │   │   └── ja.rs
+│   │   └── view/
+│   │       ├── mod.rs
+│   │       ├── menu.rs
+│   │       ├── source_pane.rs
+│   │       ├── library_pane.rs
+│   │       ├── item_table.rs
+│   │       ├── detail_pane.rs
+│   │       ├── dialogs.rs
+│   │       ├── toasts.rs
+│   │       └── shortcuts.rs
+│   │
+│   └── util/
+│       ├── mod.rs
+│       ├── debounce.rs
+│       ├── path_hash.rs             # SHA-256 ベースのファイル名生成
+│       └── atomic.rs                # atomic write (tmp + rename)
 ├── resources/
-│   ├── alc_template.xml             # .alc XML テンプレート (adapter_alc が include_str!)
+│   ├── alc_template.xml             # .alc XML テンプレート (`include_str!`)
 │   ├── fonts/                       # 同梱フォント (NotoSansCJK 等)
 │   └── icons/
 │       ├── icon.icns                # macOS
 │       ├── icon.ico                 # Windows
 │       └── drag_icon.png            # drag-out のドラッグ中プレビュー
+├── tests/                           # 統合テスト (クレート全体にアクセス可)
+│   ├── srt_parser.rs
+│   ├── alc_xml.rs                   # alc 出力のスナップショット
+│   ├── filter.rs
+│   └── insert_use_case.rs
 └── docs/
     ├── REMOTE_SCRIPT_INSTALL.md     # ユーザ向けセットアップ
     └── ARCHITECTURE.md              # 開発者向け
 ```
 
-### 3.1 crate 間の依存方向 (厳守)
+### 3.1 `lib.rs` の構造
+
+```rust
+// src/lib.rs
+pub mod domain;
+pub mod ports;
+pub mod application;
+pub mod adapter;
+pub mod runtime;
+pub mod ui;
+pub mod util;
+```
+
+`main.rs` は `lib.rs` を経由して各モジュールを使う:
+
+```rust
+// src/main.rs
+use abletonsrtbrowser::{adapter, application, runtime, ui};
+
+fn main() -> anyhow::Result<()> { /* ... 合成ルート */ }
+```
+
+`lib.rs` を分けておくと統合テスト (`tests/*.rs`) からクレート全体にアクセスできる。
+
+### 3.2 モジュール間の依存方向 (運用ルール)
 
 ```
 domain         ← (誰からも依存される / 何にも依存しない)
    ▲
    │
-ports          ← domain
+ports          ← domain のみ
    ▲
    │
 application    ← domain, ports
-adapter_*      ← domain, ports
+adapter::*     ← domain, ports
    ▲
    │
 runtime        ← domain, ports, application
-ui_egui        ← domain, runtime  (※ ports / application を直接見ない)
+ui             ← domain, runtime  (※ ports / application を直接 use しない)
    ▲
    │
-app (binary)   ← 全部
+main.rs        ← 全部 (合成ルートだけが具体型を知る)
 ```
 
-ルール:
+各モジュールの `mod.rs` 冒頭に許可される `use` 範囲をコメントで明記し、code review で違反を弾きます。CI で grep ベースの簡易チェックを追加しても良い (Section 14 参照)。
 
-- `domain` は `serde` 以外の外部依存を持たない (シリアライズは feature-gated にできる)
-- `ports` の trait は `Send` を要求する (runtime がスレッドをまたぐため)
-- `ui_egui` は `application` や `adapter_*` を**絶対に直接 use しない**。Cmd/Msg 経由のみで通信
-- `app` は具体実装を選ぶ唯一の場所 (例えば `Inserter` を `adapter_alc` と `adapter_remote` でラップした `CompositeInserter` を組み立てる)
+### 3.3 命名規則
 
-### 3.2 命名規則
+- モジュール名はスネークケース (`adapter::audio_rodio` のように技術名を suffix)
+- 同じ port に複数 adapter を持てる (例: 将来 `adapter::audio_cpal_direct` を追加可能)
+- 型名はパスカルケース、trait 名は名詞 (`Inserter`, `AudioPlayer`)、use case 型は `<動詞>UseCase` (`InsertItemsUseCase`)
 
-- crate 名はスネークケース、`adapter_<technology>` の形式 (例: `adapter_audio_rodio`)
-- 同じ port に対して複数の adapter を作れる (例: `adapter_audio_rodio` と将来の `adapter_audio_cpal_direct`)
-- モジュール名はスネークケース、型名はパスカルケース
+### 3.4 Python パッケージ
 
-### 3.3 Python パッケージの位置付け
+`crates/remote_script/` は **Cargo の管理外**。Python パッケージとして単独配布。`build.rs` から参照することもありません。リリース時は別途 zip にまとめて GitHub Release assets に同梱。
 
-`crates/remote_script/` は名前こそ `crates/` 配下ですが、**Cargo workspace のメンバーではありません** (Python なので)。リリース時は別途 zip にまとめて GitHub Release assets に同梱。`build.rs` で workspace 内パスを参照することもしません。
+### 3.5 なぜ単一クレートか
 
-### 3.4 なぜこの分割か
-
-| よくある別案 | 採用しない理由 |
+| 別案 | 採用しない理由 |
 |------|---------|
-| 単一クレート + モジュール | 依存方向が「努力目標」になり、慣性で壊れる。Rust の可視性ルールでは強制できない。 |
-| `domain` + `infra` の 2 分割 | application 層を抽出しないと use case が UI と adapter に散る。 |
-| port ごとに別 crate | やりすぎ。port は 1 つの crate に集約して概観しやすくする。 |
-| ui_egui を application に依存させる | UI が adapter 都合の型に振り回される。Msg/Cmd で疎結合のままにする方が安全。 |
+| Cargo workspace で 11 crate 分割 | 1 人メンテで boilerplate (Cargo.toml × 11、`lib.rs` × 10) が重い。コンパイル時間も増える。レイヤ強制のメリットは code review で代替可能 |
+| `core` + `ui` + `app` の 3 crate workspace | 中間案として悪くないが、レイヤを 1 段挟むだけのために workspace を構えるのはやはり過剰 |
+| すべて 1 つの `mod` 階層に flat 配置 | レイヤ責任が読み取れず、移植元 (Lua 単一ファイル) と同じ問題に陥る |
+
+将来本当にクレート分割が必要になったら、各レイヤをそのまま `crates/<layer>/src/` に `mv` できるよう、レイヤ間の `pub use` を最小に保つこと。
 
 ## 4. Cargo workspace 設定
 
